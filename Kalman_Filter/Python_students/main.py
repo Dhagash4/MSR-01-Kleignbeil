@@ -5,11 +5,11 @@ from numpy.linalg import inv
 import matplotlib.pyplot as plt
 
 
-# from functions.geodetic_tools import * 
+from functions.geodetic_tools import * 
 from functions.prediction import prediction
 from functions.timesync import timesync
 from functions.readIMARdata import *
-
+from functions.readStrapdownData import *
 
 ## Mobile Sensing and Robotics - Exercise 2 - IGG Bonn, 12.10.20
 # Author 1: M.Sc. Erik Heinz,
@@ -19,11 +19,18 @@ from functions.readIMARdata import *
 #          s7feesse@uni-bonn.de, Felix Esser (Python)
 
 # -----------------------------------------------------
+def wrapToPi(theta):
+    while theta < -np.pi:
+        theta = theta + 2 * np.pi
+    while theta > np.pi:
+        theta = theta - 2 * np.pi
+    return theta
 # read data
 imar_data = IMARdata()
 imar_data.readIMAR("data/IMAR.mat", correctedIMUdata = True)
 
-# -----------------------------------------------------
+
+#-------------------------------------------------------
 # Measurements
 
 # Info IMU
@@ -90,7 +97,7 @@ std_a =  np.std(a[0:1000])      # Accelerations [m/s^2]
 std_omega =  np.std(omega[0:1000])  # Angular rate [rad/s]
 
 # System noise
-wk_phi =  0.1  # Angular accelerations [rad/s]
+wk_phi =  0.75 # Angular accelerations [rad/s]
 wk_a =    1.5  # Linear jerk [m/s^3]
 
 # # Covariance Matrix Measurements
@@ -107,9 +114,9 @@ S_wkwk = np.array([[wk_phi**2, 0],
 S_xkxk = np.array([[1,0,0,0,0,0],
                    [0,1,0,0,0,0],
                    [0,0,1,0,0,0],
-                   [0,0,0,1,0,0],
+                   [0,0,0,wk_phi ** 2,0,0],
                    [0,0,0,0,1,0],
-                   [0,0,0,0,0,1]])
+                   [0,0,0,0,0,wk_a ** 2]])
 # # -----------------------------------------------------
 
 
@@ -158,7 +165,9 @@ print('filter started ... ')
 
 # -------------------------------------------
 # MAIN KF Loop
+d_ekf = np.zeros_like(x)
 
+count = 0
 for i in range(0, nbr ): 
     # -------------------------------------------
     # percent update 
@@ -210,7 +219,9 @@ for i in range(0, nbr ):
         # save estimation
         xstate[i,0] = imar_data.imutime[i]
         xstate[i,1:7] = x_dach.reshape(6)
-
+        d_ekf[count] = np.sqrt(np.power((xstate[i,2]-y[count]),2) + np.power((xstate[i,1]-x[count]),2))
+        
+        count += 1
         # update states for next iteration
         xk = x_dach
         S_xkxk = Sx_dach
@@ -221,6 +232,66 @@ for i in range(0, nbr ):
 print( 100, '%')
 print('... done')
 
+# -----------------------------------------------------
+# Strapdown Solution
+
+str_simple = '/home/dhagash/MS-GE-MSR-01/MSR-01(Sensors)/MSR-01-Kleignbeil/Inertial Navigation/PythonCode/analysisTool/data/nav_solution_python.txt'
+SD_simple = StrapdownData()
+SD_simple.read( str_simple , "simple")
+
+str_adv = '/home/dhagash/MS-GE-MSR-01/MSR-01(Sensors)/MSR-01-Kleignbeil/Inertial Navigation/PythonCode/analysisTool/data/Groves_accurate_solution.txt'
+SD_advanced = StrapdownData()
+SD_advanced.read( str_adv, "advanced")
+
+# time delta of interpolation
+dt = 0.1
+
+# start and end time
+start_time = np.amax(vector3(imar_data.gpstime[0], SD_simple.gpstime[0], SD_advanced.gpstime[0]) )
+end_time = np.amin(vector3(imar_data.gpstime[-1], SD_simple.gpstime[-1], SD_advanced.gpstime[-1]) )
+
+# New GPS time vector
+time_vector = np.arange(start=start_time, stop=end_time, step=dt, dtype=float)
+time_vector_red = time_vector - time_vector[0]
+
+
+f_e_imu = interpolate.interp1d( SD_simple.gpstime, SD_simple.UTM[:,0], kind='linear')
+E_sim = f_e_imu(time_vector)
+
+f_n_imu = interpolate.interp1d( SD_simple.gpstime, SD_simple.UTM[:,1] ,kind='linear')
+N_sim = f_n_imu(time_vector)
+
+# start and end time
+start_time = np.amax( vector3(imar_data.imutime[0], SD_simple.gpstime[0], SD_advanced.gpstime[0]) )
+end_time = np.amin( vector3(imar_data.imutime[-1], SD_simple.gpstime[-1], SD_advanced.gpstime[-1]) )
+
+# New GPS time vector
+time_vector_rpy = np.arange(start=start_time, stop=end_time, step=dt, dtype=float)
+time_vector_red_rpy = time_vector - time_vector[0]
+
+
+f_n_yaw = interpolate.interp1d( SD_simple.gpstime, SD_simple.rpy[:,2], kind='linear')
+yaw_sim = f_n_yaw(time_vector)
+print(yaw_sim.shape)
+f_n_yaw = interpolate.interp1d( imar_data.imutime, imar_data.rpy_ned[:,2], kind='linear')
+yaw_imar = f_n_yaw(time_vector)
+
+yaw = np.zeros_like(xstate[:,3])
+for i in range(xstate.shape[0]):
+    yaw[i] = wrapToPi(xstate[i,3])
+d_strap  = np.sqrt(np.power((N_sim[:3891]-y),2) + np.power((E_sim[:3891]-x),2))
+f_n_yaw_ekf = interpolate.interp1d( SD_simple.gpstime, yaw, kind='linear')
+yaw_ekf = f_n_yaw_ekf(time_vector)
+d_yaw_ekf = np.abs(rad2deg(yaw_imar) - rad2deg(yaw_ekf))
+d_yaw_sim = np.abs(rad2deg(yaw_imar) - yaw_sim)
+
+
+f_n_vx = interpolate.interp1d( SD_simple.gpstime, SD_simple.velo[:,0], kind='linear')
+vx_sim = f_n_vx(time_vector)
+f_n_vx_ekf = interpolate.interp1d( SD_simple.gpstime, xstate[:,6], kind='linear')
+vx_ekf = f_n_yaw_ekf(time_vector)
+
+d_vx_ekf = np.abs(vx_ekf-vx_sim)
 # --------------------------------------------------- #
 # ########### Plot EKF results ################ #
 # --------------------------------------------------- #
@@ -230,18 +301,64 @@ print('... done')
 idx_plot = np.arange(start=0, stop=nbr, step=10, dtype=int)
 
 # -------------------------------------------
-# Trajectory plot
+#Trajectory plot
 plt.plot(x,y, '.b', markersize=12)
-plt.plot(xstate[idx_plot,1], xstate[idx_plot,2], '.r')
+plt.plot(E_sim, N_sim, '.g')
 plt.axis('equal')
+plt.plot(xstate[idx_plot,1], xstate[idx_plot,2], '.r')
 plt.title('EKF Trajectory and GPS Measurements', fontsize=14, fontweight='bold')
 plt.xlabel('UTM (East) [m]', fontsize=12, fontweight='bold')
 plt.ylabel('UTM (North) [m]', fontsize=12, fontweight='bold')
-plt.legend(['GPS Measurements', 'EKF Trajectory'])
+plt.legend(['GPS Measurements', 'Strapdown_Trajectory','EKF Trajectory'])
 plt.grid(color='k', linestyle='-', linewidth=0.5)
 plt.show()
 
+# -----------------------------------------
+# Differences plot
+plt.plot(time_vector[:3891],d_ekf, '.b')
+plt.plot(time_vector[:3891],d_strap, '.g')
+plt.title('Differences of Trajectories with time', fontsize=14, fontweight='bold')
+plt.xlabel('Time [s]', fontsize=12, fontweight='bold')
+plt.ylabel('Difference w.r.t GPS [m]', fontsize=12, fontweight='bold')
+plt.legend(['EKF_Difference', 'Strapdown_Difference'])
+plt.grid(color='k', linestyle='-', linewidth=0.5)
+plt.show()
 # -------------------------------------------
+
+plt.plot(time_vector,rad2deg(yaw_ekf), '.b')
+plt.plot(time_vector,yaw_sim, '.g')
+plt.title('Heading Angle', fontsize=14, fontweight='bold')
+plt.xlabel('Time [s]', fontsize=12, fontweight='bold')
+plt.ylabel('Angle [°]', fontsize=12, fontweight='bold')
+plt.legend(['EKF_Yaw', 'Strapdown_Yaw'])
+plt.grid(color='k', linestyle='-', linewidth=0.5)
+plt.show()
+
+plt.plot(time_vector,d_yaw_ekf, '.b')
+plt.plot(time_vector,d_yaw_sim, '.g')
+plt.title('Differences in Heading Angle w.r.t IMU', fontsize=14, fontweight='bold')
+plt.xlabel('Time [s]', fontsize=12, fontweight='bold')
+plt.ylabel('Angle [°]', fontsize=12, fontweight='bold')
+plt.legend(['Diff_EKF_Yaw', 'Diff_Strapdown_Yaw'])
+plt.grid(color='k', linestyle='-', linewidth=0.5)
+plt.show()
+
+plt.plot(time_vector,vx_ekf, '.b')
+plt.plot(time_vector,vx_sim, '.g')
+plt.title('Velocities', fontsize=14, fontweight='bold')
+plt.ylabel("[m/s]", fontsize=12, fontweight='bold')
+plt.xlabel("time [s]", fontsize=12, fontweight='bold')
+plt.legend(['Velocity_EKF[Vx]', 'Velocity_Strapdown[Vx]'])
+plt.grid(color='k', linestyle='-', linewidth=0.5)
+plt.show()
+
+plt.plot(time_vector,d_vx_ekf, '.b')
+plt.title('Differences in Velocities', fontsize=14, fontweight='bold')
+plt.ylabel("[m/s]", fontsize=12, fontweight='bold')
+plt.xlabel("time [s]", fontsize=12, fontweight='bold')
+plt.legend(['Delta_Vx]'])
+plt.grid(color='k', linestyle='-', linewidth=0.5)
+plt.show()
 # Acceleration & Angular Velocity
 
 plt.subplot(211)
